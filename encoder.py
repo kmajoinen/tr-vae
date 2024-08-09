@@ -10,10 +10,9 @@ def tie_weights(src, trg):
 
 OUT_DIM = {2: 39, 4: 35, 6: 31}
 
-
 class PixelEncoder(nn.Module):
     """Convolutional encoder of pixels observations."""
-    def __init__(self, obs_shape, feature_dim, num_layers=2, num_filters=32):
+    def __init__(self, obs_shape, feature_dim, num_layers=2, num_filters=32, vae=False):
         super().__init__()
 
         assert len(obs_shape) == 3
@@ -28,8 +27,20 @@ class PixelEncoder(nn.Module):
             self.convs.append(nn.Conv2d(num_filters, num_filters, 3, stride=1))
 
         out_dim = OUT_DIM[num_layers]
-        self.fc = nn.Linear(num_filters * out_dim * out_dim, self.feature_dim)
-        self.ln = nn.LayerNorm(self.feature_dim)
+
+        self.vae = vae
+        print(f"VAE: {self.vae}")
+
+        if self.vae:
+            self.fc_mu = nn.Linear(num_filters * out_dim * out_dim, self.feature_dim)
+            self.ln_mu = nn.LayerNorm(self.feature_dim)
+
+            self.fc_logvar = nn.Linear(num_filters * out_dim * out_dim, self.feature_dim)
+            self.ln_logvar = nn.LayerNorm(self.feature_dim)
+        else:
+            self.fc = nn.Linear(num_filters * out_dim * out_dim, self.feature_dim)
+            self.ln = nn.LayerNorm(self.feature_dim)
+        
 
         self.outputs = dict()
 
@@ -58,16 +69,31 @@ class PixelEncoder(nn.Module):
         if detach:
             h = h.detach()
 
-        h_fc = self.fc(h)
-        self.outputs['fc'] = h_fc
+        if not self.vae:
+            h_fc = self.fc(h)
+            self.outputs['fc'] = h_fc
 
-        h_norm = self.ln(h_fc)
-        self.outputs['ln'] = h_norm
+            h_norm = self.ln(h_fc)
+            self.outputs['ln'] = h_norm
 
-        out = torch.tanh(h_norm)
-        self.outputs['tanh'] = out
+            out = torch.tanh(h_norm)
+            self.outputs['tanh'] = out
 
-        return out
+            return out
+        else:
+            h_fc_mu = self.fc_mu(h)
+            #self.outputs['fc'] = h_fc
+
+            h_norm_mu = self.ln_mu(h_fc_mu)
+            #self.outputs['ln'] = h_norm
+
+            h_fc_logvar = self.fc_logvar(h)
+            #self.outputs['fc'] = h_fc
+
+            h_norm_logvar = self.ln_logvar(h_fc_logvar)
+            #self.outputs['ln'] = h_norm
+
+            return [h, h_norm_mu, h_norm_logvar]
 
     def copy_conv_weights_from(self, source):
         """Tie convolutional layers"""
@@ -91,7 +117,7 @@ class PixelEncoder(nn.Module):
 
 
 class IdentityEncoder(nn.Module):
-    def __init__(self, obs_shape, feature_dim, num_layers, num_filters):
+    def __init__(self, obs_shape, feature_dim, num_layers, num_filters, vae):
         super().__init__()
 
         assert len(obs_shape) == 1
@@ -111,9 +137,9 @@ _AVAILABLE_ENCODERS = {'pixel': PixelEncoder, 'identity': IdentityEncoder}
 
 
 def make_encoder(
-    encoder_type, obs_shape, feature_dim, num_layers, num_filters
+    encoder_type, obs_shape, feature_dim, num_layers, num_filters, vae
 ):
     assert encoder_type in _AVAILABLE_ENCODERS
     return _AVAILABLE_ENCODERS[encoder_type](
-        obs_shape, feature_dim, num_layers, num_filters
+        obs_shape, feature_dim, num_layers, num_filters, vae
     )

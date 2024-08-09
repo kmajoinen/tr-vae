@@ -60,6 +60,9 @@ def parse_args():
     parser.add_argument('--decoder_weight_lambda', default=1e-7, type=float)
     parser.add_argument('--num_layers', default=4, type=int)
     parser.add_argument('--num_filters', default=32, type=int)
+    parser.add_argument('--vae', default=False, type=bool)
+    parser.add_argument('--beta', default=1e-7, type=float)
+    parser.add_argument('--beta2', default=0, type=float)
     # sac
     parser.add_argument('--discount', default=0.99, type=float)
     parser.add_argument('--init_temperature', default=0.1, type=float)
@@ -72,12 +75,13 @@ def parse_args():
     parser.add_argument('--save_model', default=False, action='store_true')
     parser.add_argument('--save_buffer', default=False, action='store_true')
     parser.add_argument('--save_video', default=False, action='store_true')
+    parser.add_argument('--wandb_sync', default=False, action='store_true')
 
     args = parser.parse_args()
     return args
 
 
-def evaluate(env, agent, video, num_episodes, L, step):
+def evaluate(env, agent, video, num_episodes, step):
     for i in range(num_episodes):
         obs = env.reset()
         video.init(enabled=(i == 0))
@@ -91,16 +95,17 @@ def evaluate(env, agent, video, num_episodes, L, step):
             episode_reward += reward
 
         video.save('%d.mp4' % step)
-        L.log('eval/episode_reward', episode_reward, step)
-    L.dump(step)
+        #L.log('eval/episode_reward', episode_reward, step)
+    #L.dump(step)
 
 
-def make_agent(obs_shape, action_shape, args, device):
+def make_agent(obs_shape, action_shape, args, device, run):
     if args.agent == 'sac_ae':
         return SacAeAgent(
             obs_shape=obs_shape,
             action_shape=action_shape,
             device=device,
+            run=run,
             hidden_dim=args.hidden_dim,
             discount=args.discount,
             init_temperature=args.init_temperature,
@@ -116,6 +121,9 @@ def make_agent(obs_shape, action_shape, args, device):
             critic_tau=args.critic_tau,
             critic_target_update_freq=args.critic_target_update_freq,
             encoder_type=args.encoder_type,
+            is_vae=args.vae,
+            beta=args.beta,
+            beta2=args.beta2,
             encoder_feature_dim=args.encoder_feature_dim,
             encoder_lr=args.encoder_lr,
             encoder_tau=args.encoder_tau,
@@ -125,7 +133,8 @@ def make_agent(obs_shape, action_shape, args, device):
             decoder_latent_lambda=args.decoder_latent_lambda,
             decoder_weight_lambda=args.decoder_weight_lambda,
             num_layers=args.num_layers,
-            num_filters=args.num_filters
+            num_filters=args.num_filters,
+            wb=args.wandb_sync
         )
     else:
         assert 'agent is not supported: %s' % args.agent
@@ -133,6 +142,7 @@ def make_agent(obs_shape, action_shape, args, device):
 
 def main():
     args = parse_args()
+    print(args)
     utils.set_seed_everywhere(args.seed)
 
     env = dmc2gym.make(
@@ -146,6 +156,21 @@ def main():
         frame_skip=args.action_repeat
     )
     env.seed(args.seed)
+
+    wb = args.wandb_sync
+    run_name = f"OG_BL_{args.task_name}_b-{args.beta}_b2-{args.beta2}_s-{args.seed}"
+    proj_name = "Baselines"
+    if wb:
+        import wandb
+
+        run = wandb.init(
+            project=proj_name,
+            config=vars(args),
+            name=run_name,
+            save_code=True
+        )
+        print("WANDB")
+
 
     # stack several consecutive frames together
     if args.encoder_type == 'pixel':
@@ -179,38 +204,54 @@ def main():
         obs_shape=env.observation_space.shape,
         action_shape=env.action_space.shape,
         args=args,
-        device=device
+        device=device,
+        run=run
     )
 
-    L = Logger(args.work_dir, use_tb=args.save_tb)
-
+    #L = Logger(args.work_dir, use_tb=args.save_tb)
+    L = 0
+    initial_state = None
     episode, episode_reward, done = 0, 0, True
     start_time = time.time()
     for step in range(args.num_train_steps):
         if done:
             if step > 0:
-                L.log('train/duration', time.time() - start_time, step)
+                #L.log('train/duration', time.time() - start_time, step)
                 start_time = time.time()
-                L.dump(step)
+                #L.dump(step)
 
             # evaluate agent periodically
             if step % args.eval_freq == 0:
-                L.log('eval/episode', episode, step)
-                evaluate(env, agent, video, args.num_eval_episodes, L, step)
+                #L.log('eval/episode', episode, step)
+                evaluate(env, agent, video, args.num_eval_episodes, step)
                 if args.save_model:
                     agent.save(model_dir, step)
                 if args.save_buffer:
                     replay_buffer.save(buffer_dir)
 
-            L.log('train/episode_reward', episode_reward, step)
+            #L.log('train/episode_reward', episode_reward, step)
+            print(f"Step: {step} - Episode reward: {episode_reward}")
+            if wb:
+                run.define_metric("Episodic_return", step_metric="Global_step")
+                run.log({"Episodic_return": episode_reward,
+                        "Global_step":  step})
 
             obs = env.reset()
+
+            # if initial_state is None:
+            #     initial_state = torch.FloatTensor(obs).to(device)
+            #     # initial_state = initial_state.unsqueeze(0)
+
             done = False
             episode_reward = 0
             episode_step = 0
             episode += 1
 
-            L.log('train/episode', episode, step)
+            # if args.vae and wb:
+            #     print(f"INITIAL: {initial_state.shape}")
+            #     #agent.eval_posterior_KL(initial_state, step)
+
+            #L.log('train/episode', episode, step)
 
         # sample action for data collection
         if step < args.init_steps:

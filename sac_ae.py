@@ -4,13 +4,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import copy
 import math
+from copy import deepcopy
 
 import utils
 from encoder import make_encoder
 from decoder import make_decoder
 
 LOG_FREQ = 10000
-
 
 def gaussian_logprob(noise, log_std):
     """Compute Gaussian log probability."""
@@ -49,13 +49,15 @@ class Actor(nn.Module):
     """MLP actor network."""
     def __init__(
         self, obs_shape, action_shape, hidden_dim, encoder_type,
-        encoder_feature_dim, log_std_min, log_std_max, num_layers, num_filters
+        encoder_feature_dim, log_std_min, log_std_max, num_layers, num_filters, vae
     ):
         super().__init__()
 
+        self.vae = vae
+
         self.encoder = make_encoder(
             encoder_type, obs_shape, encoder_feature_dim, num_layers,
-            num_filters
+            num_filters, vae
         )
 
         self.log_std_min = log_std_min
@@ -73,9 +75,14 @@ class Actor(nn.Module):
     def forward(
         self, obs, compute_pi=True, compute_log_pi=True, detach_encoder=False
     ):
-        obs = self.encoder(obs, detach=detach_encoder)
-
-        mu, log_std = self.trunk(obs).chunk(2, dim=-1)
+        out = self.encoder(obs, detach=detach_encoder)
+        if not self.vae:
+            obs = out
+            mu, log_std = self.trunk(obs).chunk(2, dim=-1)
+        else:
+            _ , mu_vae, logvar = out #log_std is logvar
+            obs = self.encoder.reparameterize(mu_vae, logvar)
+            mu, log_std = self.trunk(obs).chunk(2, dim=-1)
 
         # constrain log_std inside [log_std_min, log_std_max]
         log_std = torch.tanh(log_std)
@@ -137,15 +144,21 @@ class Critic(nn.Module):
     """Critic network, employes two q-functions."""
     def __init__(
         self, obs_shape, action_shape, hidden_dim, encoder_type,
-        encoder_feature_dim, num_layers, num_filters
+        encoder_feature_dim, num_layers, num_filters, vae
     ):
         super().__init__()
 
+        self.vae = vae
 
         self.encoder = make_encoder(
             encoder_type, obs_shape, encoder_feature_dim, num_layers,
-            num_filters
+            num_filters, vae
         )
+        self.prev_encoder = make_encoder(
+            encoder_type, obs_shape, encoder_feature_dim, num_layers,
+            num_filters, vae
+        )
+        self.prev_encoder_state = deepcopy(self.encoder.state_dict())
 
         self.Q1 = QFunction(
             self.encoder.feature_dim, action_shape[0], hidden_dim
@@ -159,7 +172,12 @@ class Critic(nn.Module):
 
     def forward(self, obs, action, detach_encoder=False):
         # detach_encoder allows to stop gradient propogation to encoder
-        obs = self.encoder(obs, detach=detach_encoder)
+        out = self.encoder(obs, detach=detach_encoder) #TODO: different when VAE
+        if not self.vae:
+            obs = out
+        else:
+            _, mu, log_std = out
+            obs = self.encoder.reparameterize(mu, log_std)
 
         q1 = self.Q1(obs, action)
         q2 = self.Q2(obs, action)
@@ -190,6 +208,7 @@ class SacAeAgent(object):
         obs_shape,
         action_shape,
         device,
+        run=None,
         hidden_dim=256,
         discount=0.99,
         init_temperature=0.01,
@@ -205,6 +224,9 @@ class SacAeAgent(object):
         critic_tau=0.005,
         critic_target_update_freq=2,
         encoder_type='pixel',
+        is_vae=False,
+        beta=1e-7,
+        beta2=0,
         encoder_feature_dim=50,
         encoder_lr=1e-3,
         encoder_tau=0.005,
@@ -214,7 +236,8 @@ class SacAeAgent(object):
         decoder_latent_lambda=0.0,
         decoder_weight_lambda=0.0,
         num_layers=4,
-        num_filters=32
+        num_filters=32,
+        wb=False
     ):
         self.device = device
         self.discount = discount
@@ -224,21 +247,30 @@ class SacAeAgent(object):
         self.critic_target_update_freq = critic_target_update_freq
         self.decoder_update_freq = decoder_update_freq
         self.decoder_latent_lambda = decoder_latent_lambda
+        self.vae = is_vae
+        self.beta = beta
+        self.beta2 = beta2
+        # self.wb = wb
+        # self.wb_imported = False
+        if wb:
+            import wandb
+        self.run = run # W&B object for logging 
+        self.eval_ob = None
 
         self.actor = Actor(
             obs_shape, action_shape, hidden_dim, encoder_type,
             encoder_feature_dim, actor_log_std_min, actor_log_std_max,
-            num_layers, num_filters
+            num_layers, num_filters, is_vae
         ).to(device)
 
         self.critic = Critic(
             obs_shape, action_shape, hidden_dim, encoder_type,
-            encoder_feature_dim, num_layers, num_filters
+            encoder_feature_dim, num_layers, num_filters, is_vae
         ).to(device)
 
         self.critic_target = Critic(
             obs_shape, action_shape, hidden_dim, encoder_type,
-            encoder_feature_dim, num_layers, num_filters
+            encoder_feature_dim, num_layers, num_filters, is_vae
         ).to(device)
 
         self.critic_target.load_state_dict(self.critic.state_dict())
@@ -327,7 +359,7 @@ class SacAeAgent(object):
         current_Q1, current_Q2 = self.critic(obs, action)
         critic_loss = F.mse_loss(current_Q1,
                                  target_Q) + F.mse_loss(current_Q2, target_Q)
-        L.log('train_critic/loss', critic_loss, step)
+        #L.log('train_critic/loss', critic_loss, step)
 
 
         # Optimize the critic
@@ -335,7 +367,23 @@ class SacAeAgent(object):
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        self.critic.log(L, step)
+        #self.critic.log(L, step)
+
+        if self.run is not None and step % 100 == 0:
+            self.run.define_metric("losses/Q1_value", step_metric="Global_step")
+            self.run.define_metric("losses/Q2_value", step_metric="Global_step")
+            # self.run.define_metric("losses/Q1_loss", step_metric="Global_step")
+            # self.run.define_metric("losses/Q2_loss", step_metric="Global_step")
+            self.run.define_metric("losses/Q_loss", step_metric="Global_step")
+            self.run.log(
+            {
+            "losses/Q1_value": current_Q1.mean().item(),
+            "losses/Q2_value": current_Q2.mean().item(),
+            # "losses/Q1_loss": q1_loss.item(),
+            # "losses/Q2_loss": q2_loss.item(),
+            "losses/Q_loss": critic_loss.item() / 2.0,
+            "Global_step": step
+            })
 
     def update_actor_and_alpha(self, obs, L, step):
         # detach encoder, so we don't update it with the actor loss
@@ -343,28 +391,35 @@ class SacAeAgent(object):
         actor_Q1, actor_Q2 = self.critic(obs, pi, detach_encoder=True)
 
         actor_Q = torch.min(actor_Q1, actor_Q2)
-        actor_loss = (self.alpha.detach() * log_pi - actor_Q).mean()
+        actor_loss = (self.alpha.detach() * log_pi - actor_Q).mean() # TODO: log this
 
-        L.log('train_actor/loss', actor_loss, step)
-        L.log('train_actor/target_entropy', self.target_entropy, step)
+        # L.log('train_actor/loss', actor_loss, step)
+        # L.log('train_actor/target_entropy', self.target_entropy, step)
         entropy = 0.5 * log_std.shape[1] * (1.0 + np.log(2 * np.pi)
                                             ) + log_std.sum(dim=-1)
-        L.log('train_actor/entropy', entropy.mean(), step)
+        # L.log('train_actor/entropy', entropy.mean(), step)
 
         # optimize the actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
 
-        self.actor.log(L, step)
+        #self.actor.log(L, step)
 
         self.log_alpha_optimizer.zero_grad()
         alpha_loss = (self.alpha *
                       (-log_pi - self.target_entropy).detach()).mean()
-        L.log('train_alpha/loss', alpha_loss, step)
-        L.log('train_alpha/value', self.alpha, step)
+        # L.log('train_alpha/loss', alpha_loss, step)
+        # L.log('train_alpha/value', self.alpha, step)
         alpha_loss.backward()
         self.log_alpha_optimizer.step()
+        if self.run is not None and step % 100 == 0:
+            self.run.define_metric("losses/policy_loss", step_metric="Global_step")
+            self.run.log(
+            {
+            "losses/policy_loss": actor_loss.item(),
+            "Global_step": step
+            })
 
     def update_decoder(self, obs, target_obs, L, step):
         h = self.critic.encoder(obs)
@@ -372,29 +427,69 @@ class SacAeAgent(object):
         if target_obs.dim() == 4:
             # preprocess images to be in [-0.5, 0.5] range
             target_obs = utils.preprocess_obs(target_obs)
-        rec_obs = self.decoder(h)
-        rec_loss = F.mse_loss(target_obs, rec_obs)
+        if not self.vae:
+            rec_obs = self.decoder(h)
+            rec_loss = F.mse_loss(target_obs, rec_obs)
 
-        # add L2 penalty on latent representation
-        # see https://arxiv.org/pdf/1903.12436.pdf
-        latent_loss = (0.5 * h.pow(2).sum(1)).mean()
+            # add L2 penalty on latent representation
+            # see https://arxiv.org/pdf/1903.12436.pdf
+            latent_loss = (0.5 * h.pow(2).sum(1)).mean()
 
-        loss = rec_loss + self.decoder_latent_lambda * latent_loss
+            loss = rec_loss + self.decoder_latent_lambda * latent_loss
+        elif self.vae:
+            self.critic.prev_encoder_state = deepcopy(self.critic.encoder.state_dict())
+            _ , mu, logvar = h
+            z = self.critic.encoder.reparameterize(mu, logvar)
+            _, mu_prev, logvar_prev = self.critic.prev_encoder(obs)
+
+            rec_obs = self.decoder(z)
+            recon_loss = ((target_obs - rec_obs)**2).sum()
+
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp()).sum()
+
+            var = torch.exp(logvar) 
+            var_prev = torch.exp(logvar_prev)
+            kl_loss_post = torch.sum(
+                        logvar_prev - logvar + (var + (mu - mu_prev).pow(2)) / (2*var_prev) - 0.5
+                    ).sum()
+
+            loss = recon_loss + (self.beta * kl_loss) + (self.beta2 * kl_loss_post)
+            if self.run is not None and (step % 100 == 0 or step == 0):
+                self.run.define_metric("VAE KL posterior loss", step_metric = "Global_step")
+                self.run.define_metric("VAE total loss", step_metric = "Global_step")
+                self.run.define_metric("VAE recon loss", step_metric = "Global_step")
+                self.run.define_metric("VAE KL prior loss", step_metric = "Global_step")
+                self.run.log({"VAE KL posterior loss": kl_loss_post.item()/len(obs),
+                   "Global_step": step})
+                self.run.log({"VAE total loss": loss.item()/len(obs),
+                    "Global_step": step})
+                self.run.log({"VAE recon loss": recon_loss.item()/len(obs),
+                    "Global_step": step})
+                self.run.log({"VAE KL prior loss": kl_loss.item()/len(obs),
+                    "Global_step": step})
+                self.eval_posterior_KL(self.eval_ob, step)
+                if step % 10000 == 0 or step == 0:
+                    print(f"Current KL posterior loss {kl_loss_post} - step {step}")
+                    print(f"Post loss term {self.beta2*kl_loss_post}")
+
         self.encoder_optimizer.zero_grad()
         self.decoder_optimizer.zero_grad()
         loss.backward()
 
         self.encoder_optimizer.step()
         self.decoder_optimizer.step()
-        L.log('train_ae/ae_loss', loss, step)
+        if self.vae:
+            self.critic.prev_encoder.load_state_dict(self.critic.prev_encoder_state)
+        # L.log('train_ae/ae_loss', loss, step)
 
-        self.decoder.log(L, step, log_freq=LOG_FREQ)
+        # self.decoder.log(L, step, log_freq=LOG_FREQ)
 
     def update(self, replay_buffer, L, step):
         obs, action, reward, next_obs, not_done = replay_buffer.sample()
 
-        L.log('train/batch_reward', reward.mean(), step)
-
+        # L.log('train/batch_reward', reward.mean(), step)
+        if self.eval_ob is None:
+            self.eval_ob = obs
         self.update_critic(obs, action, reward, next_obs, not_done, L, step)
 
         if step % self.actor_update_freq == 0:
@@ -439,3 +534,17 @@ class SacAeAgent(object):
             self.decoder.load_state_dict(
                 torch.load('%s/decoder_%s.pt' % (model_dir, step))
             )
+
+    def eval_posterior_KL(self, obs, step):
+
+        _, mu, logvar = self.critic.encoder(obs)
+        _, mu_prev, logvar_prev = self.critic.prev_encoder(obs)
+        
+        var = torch.exp(logvar) #previous batch with current encoder
+        var_prev = torch.exp(logvar_prev)#previous batch with previous encoder
+        kl_div = torch.sum(
+                        logvar_prev - logvar + (var + (mu - mu_prev).pow(2)) / (2*var_prev) - 0.5
+                    ).sum()
+        self.run.define_metric("VAE KL div post (initial state)", step_metric = "Global_step")
+        self.run.log({"VAE KL div post (initial state)": kl_div.item()/len(obs),
+                   "Global_step": step})

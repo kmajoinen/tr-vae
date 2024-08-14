@@ -161,13 +161,14 @@ def main():
     wb = args.wandb_sync
     if args.vae:
         if args.beta2 == 0:
-            type = "VAE_BL"
+            run_type = "VAE_BL"
         else:
-            type = "TR-VAE"
+            run_type = "TR-VAE"
     else:
-        type = "OG_BL"
-    run_name = f"{type}_{args.task_name}_b-{args.beta}_b2-{args.beta2}_s-{args.seed}"
+        run_type = "OG_BL"
+    run_name = f"{run_type}_{args.task_name}_b-{args.beta}_b2-{args.beta2}_s-{args.seed}"
     proj_name = args.proj_name
+    print(f'{run_type} - {proj_name}')
     if wb:
         import wandb
 
@@ -178,6 +179,8 @@ def main():
             save_code=True
         )
         print("WANDB")
+    else:
+        run = None
 
 
     # stack several consecutive frames together

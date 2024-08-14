@@ -545,6 +545,7 @@ class SacAeAgent(object):
         kl_div = torch.sum(
                         logvar_prev - logvar + (var + (mu - mu_prev).pow(2)) / (2*var_prev) - 0.5
                     ).sum()
-        self.run.define_metric("VAE KL div post (initial state)", step_metric = "Global_step")
-        self.run.log({"VAE KL div post (initial state)": kl_div.item()/len(obs),
-                   "Global_step": step})
+        if self.run is not None:
+            self.run.define_metric("VAE KL div post (initial state)", step_metric = "Global_step")
+            self.run.log({"VAE KL div post (initial state)": kl_div.item()/len(obs),
+                    "Global_step": step})

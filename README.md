@@ -1,3 +1,13 @@
+# Trust-region VAE implementation for a SAC agent in PyTorch
+
+This repository contains an implementation of a VAE and a trust-region optimization for
+the VAE. The purpose is to improve the consistency of represenations and thereby the performance
+of the RL agent. Our methodolgy is implemented into a fork of the repository of Denis Yarats (their README below).
+
+The project uses Weights & Biases to log the results instead of the logger used by the original project, thought that implementation is present but commented out. 
+
+---
+
 # SAC+AE implementation in PyTorch
 
 This is PyTorch implementation of SAC+AE from

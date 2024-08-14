@@ -76,6 +76,7 @@ def parse_args():
     parser.add_argument('--save_buffer', default=False, action='store_true')
     parser.add_argument('--save_video', default=False, action='store_true')
     parser.add_argument('--wandb_sync', default=False, action='store_true')
+    parser.add_argument('--proj_name',type=str, default="trust-region autoencoder")
 
     args = parser.parse_args()
     return args
@@ -156,10 +157,17 @@ def main():
         frame_skip=args.action_repeat
     )
     env.seed(args.seed)
-
+    print(f"SEED: {args.seed}")
     wb = args.wandb_sync
-    run_name = f"OG_BL_{args.task_name}_b-{args.beta}_b2-{args.beta2}_s-{args.seed}"
-    proj_name = "Baselines"
+    if args.vae:
+        if args.beta2 == 0:
+            type = "VAE_BL"
+        else:
+            type = "TR-VAE"
+    else:
+        type = "OG_BL"
+    run_name = f"{type}_{args.task_name}_b-{args.beta}_b2-{args.beta2}_s-{args.seed}"
+    proj_name = args.proj_name
     if wb:
         import wandb
 

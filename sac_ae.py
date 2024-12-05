@@ -73,40 +73,55 @@ class Actor(nn.Module):
         self.apply(weight_init)
 
     def forward(
-        self, obs, compute_pi=True, compute_log_pi=True, detach_encoder=False
+        self, obs, compute_pi=True, compute_log_pi=True, detach_encoder=False, K=1
     ):
+        # Initialize lists to store results for K observations
+        mu_list, pi_list, log_pi_list, log_std_list = [], [], [], []
+
         out = self.encoder(obs, detach=detach_encoder)
-        if not self.vae:
-            obs = out
-            mu, log_std = self.trunk(obs).chunk(2, dim=-1)
-        else:
-            _ , mu_vae, logvar = out #log_std is logvar
+
+        _ , mu_vae, logvar = out #log_std is logvar
+
+        for _ in range(K):
             obs = self.encoder.reparameterize(mu_vae, logvar)
             mu, log_std = self.trunk(obs).chunk(2, dim=-1)
 
-        # constrain log_std inside [log_std_min, log_std_max]
-        log_std = torch.tanh(log_std)
-        log_std = self.log_std_min + 0.5 * (
-            self.log_std_max - self.log_std_min
-        ) * (log_std + 1)
+            # constrain log_std inside [log_std_min, log_std_max]
+            log_std = torch.tanh(log_std)
+            log_std = self.log_std_min + 0.5 * (
+                self.log_std_max - self.log_std_min
+            ) * (log_std + 1)
 
-        self.outputs['mu'] = mu
-        self.outputs['std'] = log_std.exp()
+            self.outputs['mu'] = mu
+            self.outputs['std'] = log_std.exp()
 
-        if compute_pi:
-            std = log_std.exp()
-            noise = torch.randn_like(mu)
-            pi = mu + noise * std
-        else:
-            pi = None
-            entropy = None
+            if compute_pi:
+                std = log_std.exp()
+                noise = torch.randn_like(mu)
+                pi = mu + noise * std
+            else:
+                pi = None
+                entropy = None
 
+            if compute_log_pi:
+                log_pi = gaussian_logprob(noise, log_std)
+            else:
+                log_pi = None
+
+            mu, pi, log_pi = squash(mu, pi, log_pi)
+
+            # append results to lists
+            mu_list.append(mu)
+            pi_list.append(pi)
+            log_pi_list.append(log_pi)
+            log_std_list.append(log_std)
+        
+        # stack results for K observations
+        mu = torch.stack(mu_list, dim=0)
+        pi = torch.stack(pi_list, dim=0)
         if compute_log_pi:
-            log_pi = gaussian_logprob(noise, log_std)
-        else:
-            log_pi = None
-
-        mu, pi, log_pi = squash(mu, pi, log_pi)
+            log_pi = torch.stack(log_pi_list, dim=0)
+        log_std = torch.stack(log_std_list, dim=0)
 
         return mu, pi, log_pi, log_std
 
@@ -170,20 +185,32 @@ class Critic(nn.Module):
         self.outputs = dict()
         self.apply(weight_init)
 
-    def forward(self, obs, action, detach_encoder=False):
+    def forward(self, obs, action, detach_encoder=False, M=1):
         # detach_encoder allows to stop gradient propogation to encoder
+        # initialize lists to store results for K observations
+        q1_list, q2_list = [], []
+        if len(action.size()) != 3:
+            # repeat action M times
+            action = action.unsqueeze(0).repeat(M, 1, 1)
         out = self.encoder(obs, detach=detach_encoder) #TODO: different when VAE
-        if not self.vae:
-            obs = out
-        else:
-            _, mu, log_std = out
+        _, mu, log_std = out
+        
+        for i in range(M):
             obs = self.encoder.reparameterize(mu, log_std)
 
-        q1 = self.Q1(obs, action)
-        q2 = self.Q2(obs, action)
+            q1 = self.Q1(obs, action[i])
+            q2 = self.Q2(obs, action[i])
 
-        self.outputs['q1'] = q1
-        self.outputs['q2'] = q2
+            #self.outputs['q1'] = q1
+            #self.outputs['q2'] = q2
+            
+            # append results to lists
+            q1_list.append(q1)
+            q2_list.append(q2)
+        
+        # stack results for K observations
+        q1 = torch.stack(q1_list, dim=0)
+        q2 = torch.stack(q2_list, dim=0)
 
         return q1, q2
 
@@ -349,18 +376,24 @@ class SacAeAgent(object):
 
     def update_critic(self, obs, action, reward, next_obs, not_done, L, step):
         with torch.no_grad():
-            _, policy_action, log_pi, _ = self.actor(next_obs)
+            _, policy_action, log_pi, _ = self.actor(next_obs, K=2)
             target_Q1, target_Q2 = self.critic_target(next_obs, policy_action)
             target_V = torch.min(target_Q1,
                                  target_Q2) - self.alpha.detach() * log_pi
             target_Q = reward + (not_done * self.discount * target_V)
 
-        # get current Q estimates
-        current_Q1, current_Q2 = self.critic(obs, action)
-        critic_loss = F.mse_loss(current_Q1,
-                                 target_Q) + F.mse_loss(current_Q2, target_Q)
-        #L.log('train_critic/loss', critic_loss, step)
+            # average Q targets for K latent samples
+            target_Q = target_Q.sum(dim=0) / target_Q.size(0)
+            
 
+        # get current Q estimates
+        M = 1 
+        current_Q1, current_Q2 = self.critic(obs, action, M = M)
+        # sum over all the Q values for the M latent samples
+        Q1_loss = F.mse_loss(current_Q1, target_Q.unsqueeze(0).repeat(M, 1, 1), reduce=False).sum(dim=0).mean()
+        Q2_loss = F.mse_loss(current_Q2, target_Q.unsqueeze(0).repeat(M, 1, 1), reduce=False).sum(dim=0).mean()
+        critic_loss = Q1_loss + Q2_loss
+        #L.log('train_critic/loss', critic_loss, step)
 
         # Optimize the critic
         self.critic_optimizer.zero_grad()

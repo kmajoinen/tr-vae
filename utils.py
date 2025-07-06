@@ -4,6 +4,7 @@ import torch.nn as nn
 import gym
 import os
 from collections import deque
+from prettytable import PrettyTable
 import random
 
 
@@ -174,3 +175,16 @@ class FrameStack(gym.Wrapper):
     def _get_obs(self):
         assert len(self._frames) == self._k
         return np.concatenate(list(self._frames), axis=0)
+
+# count number of parameters for the model
+def count_parameters(model):
+    table = PrettyTable(["Modules", "Parameters"])
+    total_params = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        params = parameter.numel()
+        table.add_row([name, params])
+        total_params += params
+    print(table)
+    print(f"Total Trainable Params: {total_params}")

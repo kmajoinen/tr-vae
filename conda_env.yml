@@ -2,7 +2,7 @@ name: pytorch_sac_ae
 channels:
   - defaults
 dependencies:
-  - python=3.6
+  - python=3.9
   - pytorch
   - torchvision
   - cudatoolkit=9.2
@@ -10,8 +10,9 @@ dependencies:
   - pyparsing
   - pip:
     - termcolor
-    - git+git://github.com/deepmind/dm_control.git
-    - git+git://github.com/denisyarats/dmc2gym.git
+    - git+https://github.com/deepmind/dm_control.git
+    - git+https://github.com/denisyarats/dmc2gym.git
     - tb-nightly
     - imageio
     - imageio-ffmpeg
+    - gym==0.25.2

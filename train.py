@@ -54,6 +54,7 @@ def parse_args():
     parser.add_argument('--encoder_lr', default=1e-3, type=float)
     parser.add_argument('--encoder_tau', default=0.05, type=float)
     parser.add_argument('--decoder_type', default='pixel', type=str)
+    parser.add_argument('--reward_pred', default=False, type=bool)
     parser.add_argument('--decoder_lr', default=1e-3, type=float)
     parser.add_argument('--decoder_update_freq', default=1, type=int)
     parser.add_argument('--decoder_latent_lambda', default=1e-6, type=float)
@@ -68,14 +69,19 @@ def parse_args():
     parser.add_argument('--init_temperature', default=0.1, type=float)
     parser.add_argument('--alpha_lr', default=1e-4, type=float)
     parser.add_argument('--alpha_beta', default=0.5, type=float)
+    # aumentation
+    parser.add_argument('--K', default=1, type=int)
+    parser.add_argument('--M', default=1, type=int)
+    parser.add_argument('--L', default=0.01, type=float)
     # misc
     parser.add_argument('--seed', default=1, type=int)
+    parser.add_argument('--gpu_num', default=0, type=int)
     parser.add_argument('--work_dir', default='.', type=str)
     parser.add_argument('--save_tb', default=False, action='store_true')
     parser.add_argument('--save_model', default=False, action='store_true')
     parser.add_argument('--save_buffer', default=False, action='store_true')
     parser.add_argument('--save_video', default=False, action='store_true')
-    parser.add_argument('--wandb_sync', default=False, action='store_true')
+    parser.add_argument('--wandb_sync', default=False, type=bool)
     parser.add_argument('--proj_name',type=str, default="trust-region autoencoder")
 
     args = parser.parse_args()
@@ -135,6 +141,10 @@ def make_agent(obs_shape, action_shape, args, device, run):
             decoder_weight_lambda=args.decoder_weight_lambda,
             num_layers=args.num_layers,
             num_filters=args.num_filters,
+            reward_pred=args.reward_pred,
+            K=args.K,
+            M=args.M,
+            L=args.L,
             wb=args.wandb_sync
         )
     else:
@@ -166,7 +176,7 @@ def main():
             run_type = "TR-VAE"
     else:
         run_type = "OG_BL"
-    run_name = f"{run_type}_{args.task_name}_b-{args.beta}_b2-{args.beta2}_s-{args.seed}"
+    run_name = f"{run_type}_{args.task_name}_K-{args.K}_M-{args.M}_L-{args.L}s-{args.seed}"
     proj_name = args.proj_name
     print(f'{run_type} - {proj_name}')
     if wb:
@@ -197,7 +207,10 @@ def main():
     with open(os.path.join(args.work_dir, 'args.json'), 'w') as f:
         json.dump(vars(args), f, sort_keys=True, indent=4)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:'+str(args.gpu_num) if torch.cuda.is_available() else 'cpu')
+    # Get the name of the current GPU
+    gpu_name = torch.cuda.get_device_name(device)
+    print(f"Currently using GPU: {gpu_name}")
 
     # the dmc2gym wrapper standardizes actions
     assert env.action_space.low.min() >= -1
@@ -219,6 +232,15 @@ def main():
         run=run
     )
 
+    #utils.count_parameters(agent.actor)
+
+    #utils.count_parameters(agent.critic)
+
+    #utils.count_parameters(agent.critic_target)
+
+    #utils.count_parameters(agent.decoder)
+
+    #utils.count_parameters(agent.critic.encoder)
     #L = Logger(args.work_dir, use_tb=args.save_tb)
     L = 0
     initial_state = None
@@ -234,7 +256,7 @@ def main():
             # evaluate agent periodically
             if step % args.eval_freq == 0:
                 #L.log('eval/episode', episode, step)
-                evaluate(env, agent, video, args.num_eval_episodes, step)
+                #evaluate(env, agent, video, args.num_eval_episodes, step)
                 if args.save_model:
                     agent.save(model_dir, step)
                 if args.save_buffer:

@@ -45,7 +45,11 @@ class PixelEncoder(nn.Module):
         self.outputs = dict()
 
     def reparameterize(self, mu, logstd):
+        
         std = torch.exp(logstd)
+        #noise = torch.randn_like(std)   # noise from standard normal distribution
+        #std = std + noise  # adding gaussian noise to std
+        
         eps = torch.randn_like(std)
         return mu + eps * std
 

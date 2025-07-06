@@ -5,16 +5,22 @@ from encoder import OUT_DIM
 
 
 class PixelDecoder(nn.Module):
-    def __init__(self, obs_shape, feature_dim, num_layers=2, num_filters=32):
+    def __init__(self, obs_shape, feature_dim, reward_pred=False, num_layers=2, num_filters=32):
         super().__init__()
 
         self.num_layers = num_layers
         self.num_filters = num_filters
+        self.reward_pred = reward_pred
         self.out_dim = OUT_DIM[num_layers]
 
         self.fc = nn.Linear(
             feature_dim, num_filters * self.out_dim * self.out_dim
         )
+
+        if self.reward_pred:
+            self.fc_reward = nn.Linear(
+                feature_dim, 1
+            )
 
         self.deconvs = nn.ModuleList()
 
@@ -31,6 +37,8 @@ class PixelDecoder(nn.Module):
         self.outputs = dict()
 
     def forward(self, h):
+        if self.reward_pred:
+            r_pred = self.fc_reward(h)
         h = torch.relu(self.fc(h))
         self.outputs['fc'] = h
 
@@ -44,7 +52,10 @@ class PixelDecoder(nn.Module):
         obs = self.deconvs[-1](deconv)
         self.outputs['obs'] = obs
 
-        return obs
+        if self.reward_pred:
+            return obs, r_pred
+        else: 
+            return obs
 
     def log(self, L, step, log_freq):
         if step % log_freq != 0:
@@ -66,9 +77,9 @@ _AVAILABLE_DECODERS = {'pixel': PixelDecoder}
 
 
 def make_decoder(
-    decoder_type, obs_shape, feature_dim, num_layers, num_filters
+    decoder_type, obs_shape, feature_dim, reward_pred, num_layers, num_filters
 ):
     assert decoder_type in _AVAILABLE_DECODERS
     return _AVAILABLE_DECODERS[decoder_type](
-        obs_shape, feature_dim, num_layers, num_filters
+        obs_shape, feature_dim, reward_pred, num_layers, num_filters
     )

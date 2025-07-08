@@ -67,10 +67,11 @@ def preprocess_obs(obs, bits=5):
 
 class ReplayBuffer(object):
     """Buffer to store environment transitions."""
-    def __init__(self, obs_shape, action_shape, capacity, batch_size, device):
+    def __init__(self, obs_shape, action_shape, capacity, batch_size, device, num_envs=1):
         self.capacity = capacity
         self.batch_size = batch_size
         self.device = device
+        self.num_envs = num_envs
 
         # the proprioceptive obs is stored as float32, pixels obs as uint8
         obs_dtype = np.float32 if len(obs_shape) == 1 else np.uint8
@@ -96,6 +97,7 @@ class ReplayBuffer(object):
         self.idx = (self.idx + 1) % self.capacity
         self.current_size = min(self.current_size + 1, self.capacity)
         self.full = self.full or self.idx == 0
+        
 
     def sample(self):
         idxs = np.random.randint(
@@ -110,7 +112,7 @@ class ReplayBuffer(object):
         #).float()
         # 
         next_obses = torch.as_tensor(
-            self.obses[(idxs+1) % self.current_size], device=self.device
+            self.obses[(idxs + self.num_envs) % self.current_size], device=self.device
         ).float()
         not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
 

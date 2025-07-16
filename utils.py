@@ -174,3 +174,31 @@ class FrameStack(gym.Wrapper):
     def _get_obs(self):
         assert len(self._frames) == self._k
         return np.concatenate(list(self._frames), axis=0)
+
+
+class NoiseObs(gym.Wrapper):
+    def __init__(self, env, noise_val=0.1):
+        gym.Wrapper.__init__(self, env)
+        self._noise_val = noise_val
+        shp = env.observation_space.shape
+        self.observation_space = env.observation_space
+        self._max_episode_steps = env._max_episode_steps
+
+    def reset(self):
+        obs = self.env.reset()
+        if self._noise_val > 0:
+            obs = self._add_noise(obs)
+        return obs
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        if self._noise_val > 0:
+            obs = self._add_noise(obs)
+        return obs, reward, done, info
+
+    def _add_noise(self, obs):
+        obs = np.array(obs, dtype=np.float32)
+        noise = np.random.normal(loc=0, scale=self._noise_val, size=obs.shape)
+        obs = obs + noise
+        obs = np.clip(obs, 0., 255.).astype(np.uint8)
+        return obs

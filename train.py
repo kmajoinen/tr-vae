@@ -22,6 +22,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     # environment
     parser.add_argument('--domain_name', default='cheetah')
+    parser.add_argument('--noise_obs', default=False, action='store_true')
+    parser.add_argument('--noise_val', default=10.0, type=float)
     parser.add_argument('--task_name', default='run')
     parser.add_argument('--image_size', default=84, type=int)
     parser.add_argument('--action_repeat', default=1, type=int)
@@ -157,6 +159,9 @@ def main():
         frame_skip=args.action_repeat
     )
     env.seed(args.seed)
+    if args.noise_obs:
+        env = utils.NoiseObs(env, noise_val=args.noise_val)
+        print(f"Adding noise to observations with value {args.noise_val}")
     print(f"SEED: {args.seed}")
     wb = args.wandb_sync
     if args.vae:

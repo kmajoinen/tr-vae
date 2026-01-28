@@ -65,6 +65,11 @@ def parse_args():
     parser.add_argument('--vae', default=False, type=bool)
     parser.add_argument('--beta', default=1e-7, type=float)
     parser.add_argument('--beta2', default=0, type=float)
+    parser.add_argument('--tr_proj', default=False, type=bool)
+    parser.add_argument('--eps_mu', default=0.03, type=float)
+    parser.add_argument('--eps_cov', default=0.001, type=float)
+    parser.add_argument('--tr_alpha', default=0.0, type=float)
+    parser.add_argument('--tr_dist_type',type=str, default="W2")
     # sac
     parser.add_argument('--discount', default=0.99, type=float)
     parser.add_argument('--init_temperature', default=0.1, type=float)
@@ -137,7 +142,11 @@ def make_agent(obs_shape, action_shape, args, device, run):
             decoder_weight_lambda=args.decoder_weight_lambda,
             num_layers=args.num_layers,
             num_filters=args.num_filters,
-            wb=args.wandb_sync
+            wb=args.wandb_sync,
+            tr_projection=args.tr_proj,
+            tr_alpha=args.tr_alpha,
+            eps_mu=args.eps_mu,
+            eps_cov=args.eps_cov
         )
     else:
         assert 'agent is not supported: %s' % args.agent
@@ -167,11 +176,16 @@ def main():
     if args.vae:
         if args.beta2 == 0:
             run_type = "VAE_BL"
+            if args.tr_proj:
+                run_type = "TR-P"
         else:
             run_type = "TR-VAE"
     else:
         run_type = "OG_BL"
-    run_name = f"{run_type}_{args.task_name}_b-{args.beta}_b2-{args.beta2}_s-{args.seed}"
+    tr_coeff = args.tr_alpha if run_type == "TR-P" else args.beta2
+    run_name = f"{run_type}_{args.task_name}_b-{args.beta}_b2-{tr_coeff}_s-{args.seed}"
+    if run_type == "TR-P":
+        run_name += f"_m-{args.eps_mu}_c-{args.eps_cov}_"
     proj_name = args.proj_name
     print(f'{run_type} - {proj_name}')
     if wb:
@@ -215,7 +229,12 @@ def main():
         batch_size=args.batch_size,
         device=device
     )
-
+    tr_dist_type = "W2"
+    if args.tr_dist_type not in ["KL","W2"]:
+        tr_dist_type = "W2"
+    else:
+        tr_dist_type = args.tr_dist_type
+        
     agent = make_agent(
         obs_shape=env.observation_space.shape,
         action_shape=env.action_space.shape,
@@ -272,16 +291,22 @@ def main():
         # sample action for data collection
         if step < args.init_steps:
             action = env.action_space.sample()
+            #action2 = agent.sample_action(obs)
+            
         else:
             with utils.eval_mode(agent):
                 action = agent.sample_action(obs)
+                #action2 = None
 
         # run training update
         if step >= args.init_steps:
             num_updates = args.init_steps if step == args.init_steps else 1
             for _ in range(num_updates):
                 agent.update(replay_buffer, L, step)
-
+        #print(f"Action value: {action}, {action.shape}")
+        # if action2 is not None:
+        #     pass
+            #rint(f"Action2 value: {action2}, {action2.shape}")
         next_obs, reward, done, _ = env.step(action)
 
         # allow infinit bootstrap

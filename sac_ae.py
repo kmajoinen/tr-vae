@@ -49,15 +49,16 @@ class Actor(nn.Module):
     """MLP actor network."""
     def __init__(
         self, obs_shape, action_shape, hidden_dim, encoder_type,
-        encoder_feature_dim, log_std_min, log_std_max, num_layers, num_filters, vae
+        encoder_feature_dim, log_std_min, log_std_max, num_layers, num_filters, vae, tr_projection
     ):
         super().__init__()
 
         self.vae = vae
+        self.tr_proj = tr_projection
 
         self.encoder = make_encoder(
             encoder_type, obs_shape, encoder_feature_dim, num_layers,
-            num_filters, vae
+            num_filters, vae, tr_projection
         )
 
         self.log_std_min = log_std_min
@@ -81,8 +82,11 @@ class Actor(nn.Module):
             mu, log_std = self.trunk(obs).chunk(2, dim=-1)
         else:
             _ , mu_vae, logvar = out #log_std is logvar
+            # print(f"Actor shapes - Mu: {mu_vae.shape} - Logvar: {logvar.shape}")
             obs = self.encoder.reparameterize(mu_vae, logvar)
+            # print(f"Reparam: {obs.shape}")
             mu, log_std = self.trunk(obs).chunk(2, dim=-1)
+            # print(f"Trunk: {mu.shape}, {log_std.shape}")
 
         # constrain log_std inside [log_std_min, log_std_max]
         log_std = torch.tanh(log_std)
@@ -96,6 +100,7 @@ class Actor(nn.Module):
         if compute_pi:
             std = log_std.exp()
             noise = torch.randn_like(mu)
+            #print(f"Comp pi: mu {mu.shape} std {std.shape}")
             pi = mu + noise * std
         else:
             pi = None
@@ -106,8 +111,11 @@ class Actor(nn.Module):
         else:
             log_pi = None
 
+        # if pi is not None:
+        #     #print(f"Presquash: {pi.shape}")
         mu, pi, log_pi = squash(mu, pi, log_pi)
-
+        # if pi is not None:
+        #     #print(f"Squashed: {pi.shape}")
         return mu, pi, log_pi, log_std
 
     def log(self, L, step, log_freq=LOG_FREQ):
@@ -144,19 +152,20 @@ class Critic(nn.Module):
     """Critic network, employes two q-functions."""
     def __init__(
         self, obs_shape, action_shape, hidden_dim, encoder_type,
-        encoder_feature_dim, num_layers, num_filters, vae
+        encoder_feature_dim, num_layers, num_filters, vae, tr_projection
     ):
         super().__init__()
 
         self.vae = vae
+        self.tr_proj = tr_projection
 
         self.encoder = make_encoder(
             encoder_type, obs_shape, encoder_feature_dim, num_layers,
-            num_filters, vae
+            num_filters, vae, tr_projection
         )
         self.prev_encoder = make_encoder(
             encoder_type, obs_shape, encoder_feature_dim, num_layers,
-            num_filters, vae
+            num_filters, vae, tr_projection
         )
         self.prev_encoder_state = deepcopy(self.encoder.state_dict())
 
@@ -237,7 +246,11 @@ class SacAeAgent(object):
         decoder_weight_lambda=0.0,
         num_layers=4,
         num_filters=32,
-        wb=False
+        wb=False,
+        tr_projection=False,
+        tr_alpha=0.0,
+        eps_mu=0.03,
+        eps_cov=0.001
     ):
         self.device = device
         self.discount = discount
@@ -250,27 +263,31 @@ class SacAeAgent(object):
         self.vae = is_vae
         self.beta = beta
         self.beta2 = beta2
+        self.tr_alpha = tr_alpha
+        self.eps_mu = eps_mu
+        self.eps_cov = eps_cov
         # self.wb = wb
         # self.wb_imported = False
         if wb:
             import wandb
         self.run = run # W&B object for logging 
         self.eval_ob = None
+        self.tr_projection = tr_projection
 
         self.actor = Actor(
             obs_shape, action_shape, hidden_dim, encoder_type,
             encoder_feature_dim, actor_log_std_min, actor_log_std_max,
-            num_layers, num_filters, is_vae
+            num_layers, num_filters, is_vae, tr_projection
         ).to(device)
 
         self.critic = Critic(
             obs_shape, action_shape, hidden_dim, encoder_type,
-            encoder_feature_dim, num_layers, num_filters, is_vae
+            encoder_feature_dim, num_layers, num_filters, is_vae, tr_projection
         ).to(device)
 
         self.critic_target = Critic(
             obs_shape, action_shape, hidden_dim, encoder_type,
-            encoder_feature_dim, num_layers, num_filters, is_vae
+            encoder_feature_dim, num_layers, num_filters, is_vae, tr_projection
         ).to(device)
 
         self.critic_target.load_state_dict(self.critic.state_dict())
@@ -452,13 +469,32 @@ class SacAeAgent(object):
             kl_loss_post = torch.sum(
                         logvar_prev - logvar + (var + (mu - mu_prev).pow(2)) / (2*var_prev) - 0.5
                     ).sum()
-
-            loss = recon_loss + (self.beta * kl_loss) + (self.beta2 * kl_loss_post)
+            cur_mu, cur_logvar = self.critic.encoder.get_raw_mu_logvar()
+            if not self.tr_projection or cur_mu is None:
+                cur_mu = mu
+                cur_logvar = logvar
+            if self.tr_projection:
+                # print("Using TR projection loss")
+                # print(f"TR coeff: {self.tr_alpha}")
+                mu_proj, logvar_proj = self.critic.encoder.tr_projection(mu, logvar,mu_prev, logvar_prev, self.eps_mu, self.eps_cov)
+                tr_loss = self.critic.encoder.projection_loss(mu, logvar, mu_proj, logvar_proj)
+                loss = recon_loss + (self.beta * kl_loss) + (self.tr_alpha * tr_loss)
+                # print(f"Recon {recon_loss}  --  KL {self.beta * kl_loss}  --  Trust {self.tr_alpha * tr_loss}")
+            else:
+                loss = recon_loss + (self.beta * kl_loss) + (self.beta2 * kl_loss_post)
+                print(f"Recon {recon_loss}  --  KL {self.beta * kl_loss}  --  Trust {self.beta2 * kl_loss_post}")
             if self.run is not None and (step % 100 == 0 or step == 0):
+                mu_diff, logvar_diff = self.critic.encoder.get_W2_dist(mu, mu_prev,logvar,logvar_prev)
                 self.run.define_metric("VAE KL posterior loss", step_metric = "Global_step")
                 self.run.define_metric("VAE total loss", step_metric = "Global_step")
                 self.run.define_metric("VAE recon loss", step_metric = "Global_step")
                 self.run.define_metric("VAE KL prior loss", step_metric = "Global_step")
+                self.run.define_metric("Mu curr", step_metric = "Global_step")
+                self.run.define_metric("Mu prev", step_metric = "Global_step")
+                self.run.define_metric("Mu diff", step_metric = "Global_step")
+                self.run.define_metric("Logvar curr", step_metric = "Global_step")
+                self.run.define_metric("Logvar prev", step_metric = "Global_step")
+                self.run.define_metric("Logvar diff", step_metric = "Global_step")
                 self.run.log({"VAE KL posterior loss": kl_loss_post.item()/len(obs),
                    "Global_step": step})
                 self.run.log({"VAE total loss": loss.item()/len(obs),
@@ -467,10 +503,29 @@ class SacAeAgent(object):
                     "Global_step": step})
                 self.run.log({"VAE KL prior loss": kl_loss.item()/len(obs),
                     "Global_step": step})
+                self.run.log({"Mu curr": cur_mu.mean().item(),
+                    "Global_step": step})
+                self.run.log({"Mu prev": mu_prev.mean().item(),
+                    "Global_step": step})
+                self.run.log({"Mu diff": mu_diff.mean().item(),
+                    "Global_step": step})
+                self.run.log({"Logvar curr": cur_logvar.mean().item(),
+                    "Global_step": step})
+                self.run.log({"Logvar prev": logvar_prev.mean().item(),
+                    "Global_step": step})
+                self.run.log({"Logvar diff": logvar_diff.mean().item(),
+                    "Global_step": step})
                 self.eval_posterior_KL(self.eval_ob, step)
-                if step % 10000 == 0 or step == 0:
-                    print(f"Current KL posterior loss {kl_loss_post} - step {step}")
-                    print(f"Post loss term {self.beta2*kl_loss_post}")
+                if self.tr_projection:
+                    self.run.define_metric("W2 Projection loss", step_metric = "Global_step")
+                    self.run.define_metric("Mu proj", step_metric = "Global_step")
+                    self.run.define_metric("Logvar proj", step_metric = "Global_step")
+                    self.run.log({"W2 Projection loss": tr_loss.item()/len(obs),"Global_step": step})
+                    self.run.log({"Mu proj": mu.mean().item(),"Global_step": step})
+                    self.run.log({"Logvar proj": logvar.mean().item(),"Global_step": step})
+                # if step % 10000 == 0 or step == 0:
+                #     print(f"Current KL posterior loss {kl_loss_post} - step {step}")
+                #     print(f"Post loss term {self.beta2*kl_loss_post}")
 
         self.encoder_optimizer.zero_grad()
         self.decoder_optimizer.zero_grad()
